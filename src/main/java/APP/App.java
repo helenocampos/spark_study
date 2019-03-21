@@ -5,11 +5,16 @@
  */
 package APP;
 
+import Kafka.ConsumerCreator;
+import commons.TemperatureMeasurement;
 import model.*;
 import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.Date;
 import java.util.Scanner;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
 import org.apache.spark.ml.classification.LogisticRegression;
@@ -32,6 +37,7 @@ public class App
 
     static LogisticRegression lr;
     static LogisticRegressionModel lrModel;
+    public static Integer MAX_NO_MESSAGE_FOUND_COUNT = 10000;
 
     public static void main(String[] args)
     {
@@ -79,15 +85,15 @@ public class App
                 case "4":
                     if (lrModel != null)
                     {
-                        Dataset<Row> dataToEvaluate = getEntry(spark, sc);
-                        dataToEvaluate = defineFeaturesColumns(dataToEvaluate);
-                        dataToEvaluate = lrModel.transform(dataToEvaluate);
-                        printData(dataToEvaluate);
+                        Dataset<Row> dataToEvaluate = getEntryFromConsole(spark, sc);
+                        evaluateData(dataToEvaluate);
                     } else
                     {
                         System.out.println("Primeiro é necessário instanciar um modelo!");
                     }
-
+                    break;
+                case "5":
+                    listenToStream(spark);
                     break;
 
                 default:
@@ -132,20 +138,45 @@ public class App
 
     private static void printData(Dataset<Row> data)
     {
-        for (Row r : data.select("hora", "temperatura", "probability", "prediction").collectAsList())
+        for (Row r : data.select("hora", "temperatura", "prediction").collectAsList())
         {
-            System.out.println("(" + r.get(0) + ", " + r.get(1) + ") --> prob=" + r.get(2)
-                    + ", prediction=" + r.get(3));
+            boolean anomalia = r.get(2).equals(1.0);
+            if (anomalia)
+            {
+                System.out.println("(hora: " + r.get(0) + ", temp:" + r.get(1) + ") -->  anomalia");
+            } else
+            {
+                System.out.println("(hora: " + r.get(0) + ", temp:" + r.get(1) + ") -->  normal");
+            }
         }
     }
 
-    private static Dataset<Row> getEntry(SparkSession spark, Scanner sc)
+    private static Dataset<Row> getEntryFromConsole(SparkSession spark, Scanner sc)
     {
         System.out.println("Digite a hora no formato float. Exemplo: 18.512");
         float hora = sc.nextFloat();
         System.out.println("Digite a temperatura (inteiro). Exemplo: 20");
         int temperatura = sc.nextInt();
         return spark.createDataFrame(Arrays.asList(new MeasurementModel(hora, temperatura)), MeasurementModel.class);
+    }
+
+    private static Dataset<Row> getEntry(SparkSession spark, float hora, int temp)
+    {
+        return spark.createDataFrame(Arrays.asList(new MeasurementModel(hora, temp)), MeasurementModel.class);
+    }
+
+    private static void evaluateData(Dataset<Row> data)
+    {
+        if (lrModel != null)
+        {
+            Dataset<Row> dataToEvaluate = data;
+            dataToEvaluate = defineFeaturesColumns(dataToEvaluate);
+            dataToEvaluate = lrModel.transform(dataToEvaluate);
+            printData(dataToEvaluate);
+        } else
+        {
+            System.out.println("Não há nenhum modelo carregado.");
+        }
     }
 
     private static void trainModel(SparkSession spark)
@@ -176,8 +207,51 @@ public class App
             lr = LogisticRegression.load("models/" + modelName + "/lr");
             lrModel = LogisticRegressionModel.load("models/" + modelName + "/model");
             System.out.println("Modelo carregado!");
-        }else{
+        } else
+        {
             System.out.println("A model with this name does not exist.");
+        }
+    }
+
+    private static void listenToStream(SparkSession spark)
+    {
+        if (lrModel != null)
+        {
+            try (Consumer<String, TemperatureMeasurement> consumer = ConsumerCreator.createConsumer())
+            {
+                System.out.println("Escutando stream....");
+                int noMessageFound = 0;
+                while (true)
+                {
+                    ConsumerRecords<String, TemperatureMeasurement> consumerRecords = consumer.poll(java.time.Duration.ofMillis(510));
+
+                    if (consumerRecords.count() == 0)
+                    {
+                        noMessageFound++;
+                        if (noMessageFound > MAX_NO_MESSAGE_FOUND_COUNT)
+                        {
+                            break;
+                        } else
+                        {
+                            continue;
+                        }
+                    }
+                    consumerRecords.forEach(record ->
+                    {
+                        System.out.println("Sensor: "+record.value().getSensorId());
+                        float start = System.currentTimeMillis();
+                        evaluateData(getEntry(spark, record.value().getDateFloat(), (int) record.value().getTemp()));
+                        float finish = System.currentTimeMillis();
+                        double evaluationTime = (finish - start);
+                        System.out.println("Evaluated in: " + evaluationTime + " milliseconds.");
+                        System.out.println("\n\n");
+                    });
+                    consumer.commitAsync();
+                }
+            }
+        } else
+        {
+            System.out.println("Não há nenhum modelo treinado!");
         }
     }
 }
